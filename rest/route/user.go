@@ -398,6 +398,9 @@ type UsersPermissionsInput struct {
 	ResourceId string `json:"resource_id"`
 	// The resource type
 	ResourceType string `json:"resource_type"`
+	// ExcludeRepoGrants returns independently assigned project permissions,
+	// omitting access that comes from repo grants or a repo's admin list.
+	ExcludeRepoGrants bool `json:"exclude_repo_grants,omitempty"`
 }
 
 // UserPermissionsResult is a map from userId to their highest permission for the resource
@@ -440,7 +443,7 @@ func (h *allUsersPermissionsGetHandler) Parse(ctx context.Context, r *http.Reque
 	if err != nil {
 		return errors.Wrap(err, "reading permissions request from JSON request body")
 	}
-	if !utility.StringSliceContains(evergreen.ValidResourceTypes, h.input.ResourceType) {
+	if !utility.StringSliceContains(evergreen.ValidResourceTypes, h.input.ResourceType) && h.input.ResourceType != repoResourceType {
 		return errors.Errorf("invalid resource type '%s'", h.input.ResourceType)
 	}
 	if h.input.ResourceId == "" {
@@ -450,6 +453,9 @@ func (h *allUsersPermissionsGetHandler) Parse(ctx context.Context, r *http.Reque
 }
 
 func (h *allUsersPermissionsGetHandler) Run(ctx context.Context) gimlet.Responder {
+	if h.input.ResourceType == repoResourceType {
+		return getRepoUserPermissions(ctx, h.rm, h.input.ResourceId)
+	}
 	// Get roles for resource ID.
 	allRoles, err := h.rm.GetAllRoles(ctx)
 	if err != nil {
@@ -463,6 +469,9 @@ func (h *allUsersPermissionsGetHandler) Run(ctx context.Context) gimlet.Responde
 	roleIds := []string{}
 	permissionsMap := map[string]gimlet.Permissions{}
 	for _, role := range roles {
+		if h.input.ExcludeRepoGrants && (isRepoPermissionRole(role) || isNativeRepoAdminRole(role)) {
+			continue
+		}
 		// Don't return internal roles.
 		if !utility.StringSliceContains(evergreen.GeneralAccessRoles, role.ID) {
 			roleIds = append(roleIds, role.ID)
