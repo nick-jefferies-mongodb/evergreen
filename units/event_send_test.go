@@ -13,11 +13,13 @@ import (
 	"github.com/evergreen-ci/evergreen/mock"
 	"github.com/evergreen-ci/evergreen/model/event"
 	"github.com/evergreen-ci/evergreen/model/notification"
+	"github.com/evergreen-ci/evergreen/model/patch"
 	"github.com/evergreen-ci/evergreen/testutil"
 	"github.com/evergreen-ci/evergreen/util"
 	"github.com/mongodb/grip/message"
 	"github.com/mongodb/grip/send"
 	"github.com/stretchr/testify/suite"
+	"go.mongodb.org/mongo-driver/bson"
 )
 
 type eventNotificationSuite struct {
@@ -48,11 +50,24 @@ func (e *eventSendEnvironment) GetGitHubSender(string, string, evergreen.CreateI
 
 type eventSendErrorSender struct {
 	send.Sender
-	err error
+	err   error
+	sends int
 }
 
 func (s *eventSendErrorSender) SendWithError(context.Context, message.Composer) error {
+	s.sends++
 	return s.err
+}
+
+func findGitHubStatusResync(ctx context.Context, patchID string) (*patch.GitHubStatusResync, error) {
+	resyncs := []patch.GitHubStatusResync{}
+	if err := db.FindAllQ(ctx, patch.GitHubStatusResyncCollection, db.Query(bson.M{"_id": patchID}), &resyncs); err != nil {
+		return nil, err
+	}
+	if len(resyncs) == 0 {
+		return nil, nil
+	}
+	return &resyncs[0], nil
 }
 
 func TestEventNotificationJob(t *testing.T) {
@@ -73,7 +88,7 @@ func (s *eventNotificationSuite) SetupTest() {
 	s.env = &mock.Environment{}
 	s.NoError(s.env.Configure(s.ctx))
 
-	s.NoError(db.ClearCollections(notification.Collection, evergreen.ConfigCollection))
+	s.NoError(db.ClearCollections(notification.Collection, evergreen.ConfigCollection, patch.GitHubStatusResyncCollection))
 
 	s.notifications = []notification.Notification{
 		{
@@ -154,6 +169,7 @@ func (s *eventNotificationSuite) SetupTest() {
 				URL:     "https://example.com",
 				State:   message.GithubStateFailure,
 			},
+			Metadata: notification.NotificationMetadata{PatchID: "patch-id"},
 		},
 	}
 	s.webhook = &s.notifications[0]
@@ -337,4 +353,59 @@ func (s *eventNotificationSuite) TestPermanentGitHubFailureCompletesNotification
 	s.Require().NotNil(n)
 	s.NotZero(n.SentAt)
 	s.Equal("invalid status (HTTP status 422) after 1 attempt(s)", n.Error)
+}
+
+func (s *eventNotificationSuite) TestGitHubStatusSendMarksPatchForResync() {
+	githubErr := func(statusCode int) error {
+		return &send.GitHubSendError{StatusCode: statusCode, Attempts: 1, Err: errors.New("GitHub error")}
+	}
+	for tName, tCase := range map[string]struct {
+		sendErr      error
+		degraded     bool
+		mergeQueue   bool
+		emptyPatchID bool
+		shouldMark   bool
+	}{
+		"ServerErrorMarksPatch":               {sendErr: githubErr(http.StatusServiceUnavailable), shouldMark: true},
+		"ForbiddenMarksPatch":                 {sendErr: githubErr(http.StatusForbidden), shouldMark: true},
+		"TooManyRequestsMarksPatch":           {sendErr: githubErr(http.StatusTooManyRequests), shouldMark: true},
+		"NetworkErrorMarksPatch":              {sendErr: errors.New("connection reset"), shouldMark: true},
+		"DegradedModeMarksPatch":              {degraded: true, shouldMark: true},
+		"MergeQueueSubscriberMarksMergeQueue": {sendErr: githubErr(http.StatusBadGateway), mergeQueue: true, shouldMark: true},
+		"UnprocessableEntityDoesNotMarkPatch": {sendErr: githubErr(http.StatusUnprocessableEntity)},
+		"SuccessDoesNotMarkPatch":             {},
+		"EmptyPatchIDDoesNotMarkPatch":        {sendErr: githubErr(http.StatusServiceUnavailable), emptyPatchID: true},
+	} {
+		s.Run(tName, func() {
+			s.Require().NoError(db.ClearCollections(notification.Collection, patch.GitHubStatusResyncCollection))
+			n := s.notifications[len(s.notifications)-1]
+			if tCase.mergeQueue {
+				n.Subscriber = event.Subscriber{
+					Type:   event.GithubMergeSubscriberType,
+					Target: event.GithubMergeSubscriber{Owner: "evergreen-ci", Repo: "evergreen", Ref: "main"},
+				}
+			}
+			if tCase.emptyPatchID {
+				n.Metadata.PatchID = ""
+			}
+			s.Require().NoError(notification.InsertMany(s.ctx, n))
+
+			job := NewEventSendJob(n.ID, "").(*eventSendJob)
+			job.env = &eventSendEnvironment{
+				Environment:  s.env,
+				githubSender: &eventSendErrorSender{Sender: s.env.InternalSender, err: tCase.sendErr},
+			}
+			job.flags = &evergreen.ServiceFlags{GithubStatusAPIDisabled: tCase.degraded}
+			job.Run(s.ctx)
+
+			resync, err := findGitHubStatusResync(s.ctx, "patch-id")
+			s.Require().NoError(err)
+			if !tCase.shouldMark {
+				s.Nil(resync)
+				return
+			}
+			s.Require().NotNil(resync)
+			s.Equal(tCase.mergeQueue, resync.IsMergeQueue)
+		})
+	}
 }

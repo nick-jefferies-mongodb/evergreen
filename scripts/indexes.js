@@ -435,6 +435,13 @@ db.github_hooks.ensureIndex({
     "unique": true
 })
 
+//======github_status_resyncs======//
+db.github_status_resyncs.createIndex({
+    "last_failed_at": 1
+}, {
+    expireAfterSeconds: 21600 // 6 hours
+})
+
 //======subscriptions======//
 db.subscriptions.ensureIndex({
     "type": 1,
